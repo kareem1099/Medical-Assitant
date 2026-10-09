@@ -70,3 +70,4 @@ class MedicalAssistantState(TypedDict):
     pubmed_results: List[Dict[str, Any]]
     tool_outputs: List[Dict[str, Any]]
     final_answer: str
+    failed: bool          # True when the answer is an error placeholder (must not be stored)

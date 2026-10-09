@@ -12,7 +12,7 @@ For each uploaded PDF (scoped to a project):
 
 import logging
 import uuid
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 from pathlib import Path
 
 from langchain.text_splitter import RecursiveCharacterTextSplitter
@@ -25,6 +25,12 @@ from tools.embeddings import embed_texts
 
 
 logger = logging.getLogger(__name__)
+
+
+def _get_pdf_page_count(pdf_path: str) -> int:
+    """Return the physical page count, including pages without extractable text."""
+    with open(pdf_path, "rb") as file:
+        return len(PyPDF2.PdfReader(file).pages)
 
 
 def extract_text_from_pdf(pdf_path: str) -> List[Dict[str, Any]]:
@@ -56,7 +62,7 @@ def extract_text_from_pdf(pdf_path: str) -> List[Dict[str, Any]]:
 
             for page_num, page in enumerate(pdf_reader.pages, start=1):
                 try:
-                    text = page.extract_text()
+                    text = page.extract_text() or ""
                     if text.strip():
                         pages_data.append({'text': text, 'page': page_num})
                 except Exception as e:
@@ -85,29 +91,52 @@ def chunk_pages(pages_data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     Split extracted page text into overlapping chunks.
 
+    Each page is split on its own, so a chunk never straddles two pages and the
+    page number stored with it (used in citations) is always exact - even when
+    the same header/footer text repeats on several pages.
+
     Args:
         pages_data: List of dicts with 'text' and 'page' keys
 
     Returns:
-        List of dicts with 'text' and 'page' keys (one per chunk)
+        List of dicts with 'text' and 'page' keys (one per chunk), in page order
     """
+    if not pages_data:
+        return []
+
     text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=settings.chunk_size,
         chunk_overlap=settings.chunk_overlap,
-        separators=["\n\n", "\n", ".", "!", "?", ",", " ", ""],
-        length_function=len
+        separators=["\n\n", "\n", ".", "!", "?", "\u061f", "\u060c", ",", " ", ""],
+        length_function=len,
     )
 
-    chunks = []
+    chunks: List[Dict[str, Any]] = []
     for page_data in pages_data:
-        for chunk_text in text_splitter.split_text(page_data['text']):
-            chunks.append({'text': chunk_text, 'page': page_data['page']})
+        for chunk_text in text_splitter.split_text(page_data["text"]):
+            if chunk_text.strip():
+                chunks.append({"text": chunk_text, "page": page_data["page"]})
 
     logger.info(f"Created {len(chunks)} chunks from {len(pages_data)} pages")
     return chunks
 
 
-def process_pdf_for_project(pdf_file: str, project_id: str) -> Dict[str, Any]:
+def _rollback_file(file_id: Optional[str], error_msg: str) -> None:
+    """Undo a partially ingested file: drop its chunks/vectors and mark it failed."""
+    if not file_id:
+        return
+    try:
+        qdrant_client.delete_by_file(file_id)
+    except Exception as exc:  # the vector store may be the thing that failed
+        logger.warning(f"Could not remove vectors of failed file {file_id}: {exc}")
+    try:
+        mongo_client.delete_chunks_by_file(file_id)
+        mongo_client.mark_file_failed(file_id, error_msg)
+    except Exception as exc:
+        logger.warning(f"Could not roll back failed file {file_id}: {exc}")
+
+
+def process_pdf_for_project(pdf_file: str, project_id: str, user_id: str | None = None) -> Dict[str, Any]:
     """
     Process an uploaded PDF for a given project: extract, chunk, store in
     MongoDB, embed, and upsert into Qdrant.
@@ -136,6 +165,7 @@ def process_pdf_for_project(pdf_file: str, project_id: str) -> Dict[str, Any]:
 
         # Step 1: Extract text
         pages_data = extract_text_from_pdf(pdf_file)
+        total_pages = _get_pdf_page_count(pdf_file)
         if not pages_data:
             return {
                 "success": False,
@@ -147,7 +177,7 @@ def process_pdf_for_project(pdf_file: str, project_id: str) -> Dict[str, Any]:
 
         # Step 2: Register the file (status=processing)
         file_id = mongo_client.create_file_record(
-            project_id=project_id, filename=filename, num_pages=len(pages_data)
+            project_id=project_id, filename=filename, num_pages=total_pages
         )
 
         # Step 3: Chunk text
@@ -167,6 +197,7 @@ def process_pdf_for_project(pdf_file: str, project_id: str) -> Dict[str, Any]:
         chunk_docs = [
             {
                 "project_id": project_id,
+                "user_id": user_id,
                 "file_id": file_id,
                 "source": filename,
                 "page": raw_chunk["page"],
@@ -187,6 +218,7 @@ def process_pdf_for_project(pdf_file: str, project_id: str) -> Dict[str, Any]:
                 "point_id": point_ids[idx],
                 "vector": embeddings[idx],
                 "project_id": project_id,
+                "user_id": user_id,
                 "file_id": file_id,
                 "chunk_id": chunk_mongo_ids[idx],
                 "source": filename,
@@ -215,15 +247,13 @@ def process_pdf_for_project(pdf_file: str, project_id: str) -> Dict[str, Any]:
     except PyPDF2.errors.PdfReadError as e:
         error_msg = f"Unable to read PDF. File may be corrupted or encrypted: {str(e)}"
         logger.error(f"PDF read error for {filename}: {e}")
-        if file_id:
-            mongo_client.mark_file_failed(file_id, error_msg)
+        _rollback_file(file_id, error_msg)
         return {"success": False, "message": error_msg, "num_chunks": 0, "filename": filename, "file_id": file_id}
 
     except UnicodeDecodeError as e:
         error_msg = f"Text encoding error in PDF: {str(e)}"
         logger.error(f"Unicode error for {filename}: {e}")
-        if file_id:
-            mongo_client.mark_file_failed(file_id, error_msg)
+        _rollback_file(file_id, error_msg)
         return {"success": False, "message": error_msg, "num_chunks": 0, "filename": filename, "file_id": file_id}
 
     except FileNotFoundError:
@@ -234,6 +264,5 @@ def process_pdf_for_project(pdf_file: str, project_id: str) -> Dict[str, Any]:
     except Exception as e:
         error_msg = f"Failed to process PDF: {str(e)}"
         logger.error(f"Unexpected error processing {filename}: {e}", exc_info=True)
-        if file_id:
-            mongo_client.mark_file_failed(file_id, error_msg)
+        _rollback_file(file_id, error_msg)
         return {"success": False, "message": error_msg, "num_chunks": 0, "filename": filename, "file_id": file_id}

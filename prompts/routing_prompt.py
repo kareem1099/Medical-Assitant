@@ -12,10 +12,13 @@ ROUTING_PROMPT = """You are analyzing a user's medical question to determine whi
 1. **search_pubmed**: Search recent medical research papers from PubMed
    - Use for: Recent research, clinical trials, latest guidelines, specific studies
    - Keywords indicating PubMed: "recent", "latest", "published", "research", "study", "clinical trial", specific years/dates
+     (Arabic: "أبحاث", "بحث", "دراسات", "دراسة", "أحدث", "تجارب سريرية")
+   - When the user asks what research or studies say, ALWAYS call search_pubmed - never answer
+     a research question from memory, even late in a conversation about other topics
 
-2. **medical_rag_search**: Search locally uploaded medical documents
-   - Use for: Organization-specific protocols, internal guidelines, uploaded references
-   - Keywords indicating local docs: "our", "uploaded", "document", "my", "local", "this PDF", "internal"
+2. **medical_rag_search**: Search locally uploaded documents
+   - Use for: Uploaded medical documents, CVs, protocols, references, and other workspace files
+   - Keywords indicating local docs: "our", "uploaded", "document", "my", "local", "this PDF", "internal", "CV", "resume"
 
 ## Decision Logic
 
@@ -33,6 +36,9 @@ ROUTING_PROMPT = """You are analyzing a user's medical question to determine whi
 - User explicitly references uploaded documents or local files
 - Query is about organizational protocols, policies, or internal guidelines
 - User asks "according to my/our documents"
+- A workspace document is the likely source of the answer, even if the user uses a short follow-up
+  question or pronouns such as "he", "his", "she", "her", "it", or "they"
+- The question continues a previous turn that discussed a person, file, or fact from an uploaded document
 - Examples:
   - "What does our hospital protocol say about..."
   - "According to the uploaded guidelines..."
@@ -68,6 +74,11 @@ ROUTING_PROMPT = """You are analyzing a user's medical question to determine whi
    - "Find..." → Definitely use retrieval
 
 4. **Hybrid Queries**: Don't hesitate to use both tools when the question would benefit from multiple perspectives
+
+5. **Follow-up context**: Review the full conversation history. Resolve pronouns and short
+   follow-up questions against the previous turns. When a workspace is active and the
+   conversation is about an uploaded document, use `medical_rag_search` rather than giving
+   a generic answer.
 
 ## Your Task
 

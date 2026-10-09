@@ -53,6 +53,7 @@ def init_qdrant(vector_size: int = DEFAULT_VECTOR_SIZE) -> QdrantClient:
         _client = QdrantClient(
             url=settings.qdrant_url,
             api_key=settings.qdrant_api_key or None,
+            timeout=settings.qdrant_timeout,
         )
 
         collection_name = settings.qdrant_collection_name
@@ -122,6 +123,7 @@ def upsert_chunk_vectors(points: List[Dict[str, Any]]) -> None:
             vector=p["vector"],
             payload={
                 "project_id": p["project_id"],
+                "user_id": p.get("user_id"),
                 "file_id": p["file_id"],
                 "chunk_id": p["chunk_id"],
                 "source": p["source"],
@@ -142,7 +144,8 @@ def search(
     query_vector: List[float],
     project_id: str,
     top_k: int,
-    score_threshold: float,
+    score_threshold: Optional[float],
+    user_id: Optional[str] = None,
 ) -> List[Tuple[str, float]]:
     """
     Search for the most similar chunks within a single project.
@@ -151,28 +154,48 @@ def search(
         query_vector: Embedding of the search query.
         project_id: Restrict the search to this project's chunks.
         top_k: Max number of results to return.
-        score_threshold: Minimum cosine similarity score to include (0-1, higher = more similar).
+        score_threshold: Minimum cosine similarity score to include (higher = more similar); None = no floor.
 
     Returns:
         List of (chunk_id, score) tuples, sorted by score descending
         (Qdrant with COSINE distance already returns similarity, so higher is better).
     """
-    results = get_qdrant_client().search(
-        collection_name=settings.qdrant_collection_name,
-        query_vector=query_vector,
-        query_filter=qmodels.Filter(
-            must=[
-                qmodels.FieldCondition(
-                    key="project_id",
-                    match=qmodels.MatchValue(value=project_id),
-                )
-            ]
-        ),
-        limit=top_k,
-        score_threshold=score_threshold,
-    )
+    client = get_qdrant_client()
+    conditions = [
+            qmodels.FieldCondition(
+                key="project_id",
+                match=qmodels.MatchValue(value=project_id),
+            )
+    ]
+    if user_id:
+        conditions.append(qmodels.FieldCondition(key="user_id", match=qmodels.MatchValue(value=user_id)))
+    query_filter = qmodels.Filter(must=conditions)
 
-    return [(hit.payload["chunk_id"], hit.score) for hit in results]
+    # qdrant-client 1.10+ uses query_points; retain the legacy fallback for
+    # deployments that still expose the former search method.
+    if hasattr(client, "query_points"):
+        response = client.query_points(
+            collection_name=settings.qdrant_collection_name,
+            query=query_vector,
+            query_filter=query_filter,
+            limit=top_k,
+            score_threshold=score_threshold,
+        )
+        results = response.points
+    else:
+        results = client.search(
+            collection_name=settings.qdrant_collection_name,
+            query_vector=query_vector,
+            query_filter=query_filter,
+            limit=top_k,
+            score_threshold=score_threshold,
+        )
+
+    return [
+        (hit.payload["chunk_id"], hit.score)
+        for hit in results
+        if hit.payload and hit.payload.get("chunk_id")
+    ]
 
 
 def delete_points(point_ids: List[str]) -> None:
@@ -186,14 +209,41 @@ def delete_points(point_ids: List[str]) -> None:
     logger.info(f"Deleted {len(point_ids)} vectors from Qdrant")
 
 
+def _match_filter(key: str, value: str) -> "qmodels.Filter":
+    return qmodels.Filter(must=[qmodels.FieldCondition(key=key, match=qmodels.MatchValue(value=value))])
+
+
+def delete_by_file(file_id: str) -> None:
+    """Delete every vector that belongs to one uploaded file."""
+    get_qdrant_client().delete(
+        collection_name=settings.qdrant_collection_name,
+        points_selector=qmodels.FilterSelector(filter=_match_filter("file_id", file_id)),
+    )
+    logger.info(f"Deleted vectors of file {file_id} from Qdrant")
+
+
+def delete_by_project(project_id: str) -> None:
+    """Delete every vector that belongs to a project/workspace."""
+    get_qdrant_client().delete(
+        collection_name=settings.qdrant_collection_name,
+        points_selector=qmodels.FilterSelector(filter=_match_filter("project_id", project_id)),
+    )
+    logger.info(f"Deleted vectors of project {project_id} from Qdrant")
+
+
 def get_collection_stats() -> Dict[str, Any]:
-    """Return basic stats about the Qdrant collection."""
+    """Return basic stats about the Qdrant collection.
+
+    ``vectors_count`` was removed from recent qdrant-client versions, so only
+    ``points_count`` is relied upon (and reported under both names).
+    """
     try:
         info = get_qdrant_client().get_collection(settings.qdrant_collection_name)
+        points = getattr(info, "points_count", None) or 0
         return {
             "collection": settings.qdrant_collection_name,
-            "points_count": info.points_count,
-            "vectors_count": info.vectors_count,
+            "points_count": points,
+            "vectors_count": getattr(info, "vectors_count", None) or points,
         }
     except Exception as e:
         logger.error(f"Error getting Qdrant collection stats: {e}")

@@ -1,32 +1,38 @@
 """
 Embedding model wrapper for the Smart Medical Assistant.
 
-Previously embeddings were generated implicitly by LangChain's Chroma
-vectorstore wrapper. Since we now write vectors to Qdrant and text to
-MongoDB ourselves, we load the sentence-transformers model directly.
+Embeddings are generated here (sentence-transformers) and written to Qdrant by
+the PDF loader; chunk text itself lives in MongoDB.
+
+The heavy ``sentence_transformers`` / torch import happens lazily inside
+:func:`get_embedding_model`, so importing ``tools`` (or running the unit
+tests) does not pay that cost.
 """
 
 import logging
-from typing import List, Optional
-
-from sentence_transformers import SentenceTransformer
+from typing import TYPE_CHECKING, List, Optional
 
 from config.settings import settings
+
+if TYPE_CHECKING:  # pragma: no cover
+    from sentence_transformers import SentenceTransformer
 
 
 logger = logging.getLogger(__name__)
 
-_model: Optional[SentenceTransformer] = None
+_model: Optional["SentenceTransformer"] = None
 
 
-def get_embedding_model() -> SentenceTransformer:
+def get_embedding_model() -> "SentenceTransformer":
     """Lazily load (and cache) the sentence-transformers embedding model."""
     global _model
     if _model is None:
-        logger.info(f"Loading embedding model: {settings.embedding_model}")
+        from sentence_transformers import SentenceTransformer
+
+        logger.info("Loading embedding model: %s", settings.embedding_model)
         _model = SentenceTransformer(settings.embedding_model, device="cpu")
         logger.info(
-            f"Embedding model loaded (dim={_model.get_sentence_embedding_dimension()})"
+            "Embedding model loaded (dim=%s)", _model.get_sentence_embedding_dimension()
         )
     return _model
 

@@ -1,0 +1,5 @@
+-r requirements.txt
+pytest>=8.0
+pytest-cov>=5.0
+mongomock>=4.1        # in-memory MongoDB for tests
+reportlab>=4.0        # generates sample PDFs for tests

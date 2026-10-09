@@ -30,7 +30,11 @@ def setup_logging(log_file: str = "./logs/app.log", level: int = logging.INFO) -
     """
     # Create logs directory if it doesn't exist
     log_path = Path(log_file)
-    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_dir_error = None
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as e:          # fall back to console-only logging instead of crashing at startup
+        log_dir_error = e
     
     # Define structured log format
     # Format: 2024-01-15 10:23:45,123 - module_name - INFO - Log message
@@ -55,6 +59,8 @@ def setup_logging(log_file: str = "./logs/app.log", level: int = logging.INFO) -
     
     # File handler (INFO and above)
     try:
+        if log_dir_error:
+            raise log_dir_error
         file_handler = logging.FileHandler(log_file, mode="a", encoding="utf-8")
         file_handler.setLevel(level)
         file_handler.setFormatter(formatter)

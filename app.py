@@ -2,7 +2,7 @@
 Smart Medical Assistant - Main Application Entry Point.
 
 This is the main entry point for the Smart Medical Assistant application.
-Run this file to start the Gradio web interface.
+Run this file to start the web app (FastAPI API + the TypeScript front-end in web/).
 
 Usage:
     python app.py
@@ -12,34 +12,43 @@ The application will:
 2. Initialize logging
 3. Initialize vector store for document storage
 4. Create LangGraph workflow
-5. Launch Gradio interface
+5. Serve the API and the built front-end (web/dist)
 
 Requirements:
-    - .env file with GEMINI_API_KEY and NCBI_EMAIL configured
+    - .env file with COHERE_API_KEY and NCBI_EMAIL configured
     - All dependencies installed (pip install -r requirements.txt)
 """
 
 import sys
 import logging
+from pathlib import Path
 
-from config.settings import settings
+from config.settings import settings, validate_runtime_config
 from config.logging_config import setup_logging
 from db.mongo_client import init_mongo
 from db.qdrant_client import init_qdrant
 from tools.embeddings import get_embedding_dimension
 from graph.workflow import create_workflow
-from ui.gradio_app import create_gradio_interface
+
+WEB_DIST = Path(__file__).resolve().parent / "web" / "dist"
 
 
 def main():
     """
     Main application entry point.
     
-    Initializes all components and launches the Gradio interface.
+    Initializes all components and serves the web app.
     """
     print("=" * 60)
     print("Smart Medical Assistant")
     print("=" * 60)
+
+    try:
+        validate_runtime_config()
+    except RuntimeError as e:
+        print(f"✗ Configuration error: {e}")
+        print("Please configure the required values in .env")
+        sys.exit(1)
     
     # Step 1: Setup logging
     print("\n[1/5] Setting up logging...")
@@ -67,7 +76,7 @@ def main():
         print(f"✗ Configuration error: {e}")
         print("\nPlease ensure:")
         print("  1. .env file exists (copy from .env.example)")
-        print("  2. GEMINI_API_KEY is set")
+        print("  2. COHERE_API_KEY is set")
         print("  3. NCBI_EMAIL is set")
         sys.exit(1)
     
@@ -101,39 +110,41 @@ def main():
         print(f"✗ Workflow creation failed: {e}")
         sys.exit(1)
     
-    # Step 5: Create and launch Gradio interface
-    print("\n[5/5] Launching Gradio interface...")
+    # Step 5: Create and launch the web server (API + built front-end)
+    print("\n[5/5] Starting the web server...")
     try:
-        interface = create_gradio_interface(workflow)
-        logger.info("Gradio interface created")
-        
+        import uvicorn
+        from api.server import create_app
+        from db.mongo_client import get_db
+        from src.stores.metadata.MongoMetadataProvider import MongoMetadataProvider
+
+        if not WEB_DIST.joinpath("index.html").exists():
+            print(f"! Front-end build not found in {WEB_DIST} - only the API is served.")
+            print("  Build it with:  cd web && npm install && npm run build")
+        if not settings.app_secret:
+            print("! APP_SECRET is not set - everyone is signed out whenever the server restarts.")
+        app = create_app(workflow, MongoMetadataProvider(get_db()), static_dir=WEB_DIST)
+
+        url = f"http://{'localhost' if settings.app_host in ('127.0.0.1', '0.0.0.0') else settings.app_host}:{settings.app_port}"
         print("\n" + "=" * 60)
         print("✓ Smart Medical Assistant is ready!")
         print("=" * 60)
-        print("\nAccess the interface at:")
-        print("  - Local: http://localhost:7860")
-        print("  - Network: http://0.0.0.0:7860")
+        print(f"\nOpen {url}")
+        print("  - Set APP_HOST=0.0.0.0 to expose on the network")
         print("\nPress Ctrl+C to stop the server")
         print("=" * 60 + "\n")
-        
-        logger.info("Launching Gradio interface on port 7860")
-        
-        # Launch interface
-        interface.launch(
-            server_name="0.0.0.0",
-            server_port=7860,
-            share=False,  # Set to True to create public link
-            show_error=True
-        )
-        
+        logger.info("Starting web server on %s:%s", settings.app_host, settings.app_port)
+        uvicorn.run(app, host=settings.app_host, port=settings.app_port, log_level="warning")
     except KeyboardInterrupt:
         logger.info("Application stopped by user")
         print("\n\nApplication stopped by user")
     except Exception as e:
-        logger.error(f"Gradio launch failed: {e}", exc_info=True)
-        print(f"✗ Gradio launch failed: {e}")
+        logger.error(f"Web server failed: {e}", exc_info=True)
+        print(f"✗ Web server failed: {e}")
         sys.exit(1)
 
 
 if __name__ == "__main__":
     main()
+
+

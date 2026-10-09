@@ -1,22 +1,26 @@
-# Core Dependencies
-langchain>=0.1.0,<0.2.0
-langgraph>=0.0.20,<0.1.0
-langchain-google-genai>=1.0.0,<2.0.0
+# Core (the code relies on RunnableConfig injection into @tool functions,
+# which needs langchain-core >= 0.2 - the old <0.2 pins broke RAG/PubMed config)
+langchain>=0.3,<0.4
+langchain-core>=0.3,<0.4
+langgraph>=0.2,<0.3
+langchain-google-genai>=2.0,<3.0
+langchain-cohere>=0.3,<0.4
 
-# Vector Database (Qdrant)
-qdrant-client>=1.9.0,<2.0.0
+# Vector Database (Qdrant) - query_points() needs >= 1.10
+qdrant-client>=1.10,<2.0.0
 
 # Metadata / files / chunks storage (MongoDB)
 pymongo>=4.6.0,<5.0.0
 
 # Embeddings
-sentence-transformers>=2.2.0,<3.0.0
+sentence-transformers>=2.2.0,<4.0.0
 
 # Medical Research API
 biopython>=1.81,<2.0.0
 
-# User Interface
-gradio>=4.0.0,<5.0.0
+# Legacy Gradio UI in ui/ (gradio 4.x needs huggingface_hub < 1.0)
+gradio>=4.44,<5.0
+huggingface_hub>=0.23,<1.0
 
 # Document Processing
 PyPDF2>=3.0.0,<4.0.0
@@ -25,6 +29,11 @@ PyPDF2>=3.0.0,<4.0.0
 python-dotenv>=1.0.0,<2.0.0
 pydantic>=2.0.0,<3.0.0
 pydantic-settings>=2.0.0,<3.0.0
+
+# Web API (serves the TypeScript front-end in web/)
+fastapi>=0.110,<1.0
+uvicorn>=0.29,<1.0
+python-multipart>=0.0.9
 
 # Utilities
 typing-extensions>=4.5.0

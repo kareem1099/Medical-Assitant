@@ -7,17 +7,18 @@ Search flow:
 3. Resolve the matching chunk ids back to their full text in MongoDB
 4. Format results with source attribution (filename, page, relevance score)
 
-The tool itself only receives `query` from the LLM (that's the LangChain
-tool-calling contract) — the active project is tracked separately via a
-context variable set by the UI/workflow before each request, so concurrent
-users each get their own project scope.
+The active project is passed via LangChain's RunnableConfig so that it
+propagates correctly to tool threads spawned by LangGraph's ToolNode.
+The workflow must be invoked with:
+    config={"configurable": {"project_id": "<id>"}}
 """
 
 import logging
-from contextvars import ContextVar
+import re
 from typing import Optional
 
 from langchain.tools import tool
+from langchain_core.runnables import RunnableConfig
 
 from config.settings import settings
 from db import mongo_client
@@ -27,23 +28,25 @@ from tools.embeddings import embed_query
 
 logger = logging.getLogger(__name__)
 
-# Tracks which project the *current* request belongs to. Set via
-# set_current_project() right before invoking the LangGraph workflow.
-_current_project_id: ContextVar[Optional[str]] = ContextVar("current_project_id", default=None)
+FALLBACK_TOP_K = 3   # closest passages returned when the question names the file but nothing passes the threshold
+
+_DOCUMENT_TERMS = {
+    # English
+    "uploaded", "upload", "source", "sources", "document", "documents", "file", "files",
+    "pdf", "resume", "cv",
+    # Arabic
+    "الملف", "ملف", "الملفات", "مرفوع", "المرفوع", "مرفق", "المرفق", "المستند", "مستند",
+    "الوثيقة", "وثيقة", "السيرة", "الذاتية",
+}
 
 
-def set_current_project(project_id: Optional[str]) -> None:
-    """Set the active project for the current request/context."""
-    _current_project_id.set(project_id)
-
-
-def get_current_project() -> Optional[str]:
-    """Get the active project for the current request/context, if any."""
-    return _current_project_id.get()
+def refers_to_uploaded_documents(query: Optional[str]) -> bool:
+    """True when the question explicitly points at the user's own files."""
+    return bool(set(re.findall(r"[\w']+", (query or "").lower())) & _DOCUMENT_TERMS)
 
 
 @tool
-def medical_rag_search(query: str) -> str:
+def medical_rag_search(query: str, config: RunnableConfig) -> str:
     """
     Search uploaded medical documents (within the current project) using RAG.
 
@@ -68,7 +71,7 @@ def medical_rag_search(query: str) -> str:
         are uploaded. Returns an error message if search fails.
 
     Notes:
-        - Results are filtered by score threshold (default 0.5)
+        - Results are filtered by score threshold (default 0.2); questions that name the uploaded files fall back to the closest passages
         - Returns at most `top_k` chunks sorted by relevance (descending)
         - Requires a project to be selected and PDF documents to be uploaded first
     """
@@ -79,7 +82,9 @@ def medical_rag_search(query: str) -> str:
 
     query = query.strip()
 
-    project_id = get_current_project()
+    # Extract project_id from RunnableConfig (thread-safe, propagated by LangGraph)
+    project_id = config.get("configurable", {}).get("project_id")
+    user_id = config.get("configurable", {}).get("user_id")
     if not project_id:
         logger.warning("RAG tool called with no active project selected")
         return (
@@ -95,9 +100,24 @@ def medical_rag_search(query: str) -> str:
         hits = qdrant_client.search(
             query_vector=query_vector,
             project_id=project_id,
+            user_id=user_id,
             top_k=settings.top_k,
             score_threshold=settings.score_threshold,
         )
+
+        # "Summarize the file", Arabic questions or loosely worded ones score low
+        # against the passages they are about. When the person explicitly asks
+        # about their files, hand over the closest passages and let the model judge.
+        low_relevance = False
+        if not hits and refers_to_uploaded_documents(query):
+            hits = qdrant_client.search(
+                query_vector=query_vector,
+                project_id=project_id,
+                user_id=user_id,
+                top_k=FALLBACK_TOP_K,
+                score_threshold=None,   # no floor: cosine can be negative for "summarize the file"
+            )
+            low_relevance = bool(hits)
 
         if not hits:
             return (
@@ -107,9 +127,14 @@ def medical_rag_search(query: str) -> str:
 
         # Resolve chunk text from MongoDB, preserving Qdrant's relevance order
         chunk_ids = [chunk_id for chunk_id, _score in hits]
-        chunks_by_id = mongo_client.get_chunks_by_ids(chunk_ids)
+        chunks_by_id = mongo_client.get_chunks_by_ids(chunk_ids, user_id=user_id)
 
         formatted_results = ["=== Local Document Search Results ===\n"]
+        if low_relevance:
+            formatted_results.append(
+                "Note: no passage matched the question closely; these are the closest passages "
+                "from the uploaded documents. Use them only if they actually answer the question.\n"
+            )
         idx = 0
         for chunk_id, score in hits:
             chunk = chunks_by_id.get(chunk_id)
@@ -123,7 +148,7 @@ def medical_rag_search(query: str) -> str:
             chunk_entry += f"Source: {chunk['source']}\n"
             chunk_entry += f"Page: {chunk['page']}\n"
             chunk_entry += f"Relevance: {score:.2f}\n"
-            chunk_entry += f"Content: {content[:500]}{'...' if len(content) > 500 else ''}\n"
+            chunk_entry += f"Content: {content}\n"
             chunk_entry += "-" * 80 + "\n"
             formatted_results.append(chunk_entry)
 

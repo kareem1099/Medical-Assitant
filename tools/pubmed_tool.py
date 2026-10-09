@@ -13,6 +13,7 @@ from urllib.error import HTTPError, URLError
 
 from Bio import Entrez
 from langchain.tools import tool
+from langchain_core.runnables import RunnableConfig
 
 from config.settings import settings
 
@@ -24,15 +25,8 @@ logger = logging.getLogger(__name__)
 # Structure: {query: {"result": str, "timestamp": datetime}}
 _pubmed_cache: Dict[str, Dict] = {}
 CACHE_TTL_SECONDS = 3600  # 1 hour
-
-
-# Configure Entrez with email from settings
-Entrez.email = settings.ncbi_email
-if settings.ncbi_api_key:
-    Entrez.api_key = settings.ncbi_api_key
-    logger.info("NCBI API key configured (10 requests/second)")
-else:
-    logger.info("No NCBI API key - using standard rate limit (3 requests/second)")
+MAX_CACHE_ENTRIES = 200
+MAX_ABSTRACT_CHARS = 2000
 
 
 def _check_cache(query: str) -> Optional[str]:
@@ -54,6 +48,10 @@ def _check_cache(query: str) -> Optional[str]:
 
 def _update_cache(query: str, result: str) -> None:
     """Store query result in cache with timestamp."""
+    if len(_pubmed_cache) >= MAX_CACHE_ENTRIES and query not in _pubmed_cache:
+        # Evict the oldest entry so a long-running server cannot grow without bound.
+        oldest = min(_pubmed_cache, key=lambda k: _pubmed_cache[k]["timestamp"])
+        del _pubmed_cache[oldest]
     _pubmed_cache[query] = {
         "result": result,
         "timestamp": datetime.now()
@@ -62,7 +60,7 @@ def _update_cache(query: str, result: str) -> None:
 
 
 @tool
-def search_pubmed(query: str) -> str:
+def search_pubmed(query: str, config: RunnableConfig) -> str:
     """
     Search PubMed for recent medical research papers.
     
@@ -101,6 +99,10 @@ def search_pubmed(query: str) -> str:
         - Handles API errors gracefully with descriptive messages
         - Rate limits: 3 req/sec (standard) or 10 req/sec (with API key)
     """
+    email = config.get("configurable", {}).get("ncbi_email") or settings.ncbi_email
+    if not email or "@" not in email:
+        return "Error: A valid NCBI email is required. Enter your email in the application before using PubMed."
+
     # Input validation
     if not query or not query.strip():
         error_msg = "Empty query provided. Please provide a medical research question."
@@ -127,7 +129,9 @@ def search_pubmed(query: str) -> str:
             db="pubmed",
             term=query,
             retmax=settings.top_k,
-            sort="relevance"
+            sort="relevance",
+            email=email,
+            api_key=settings.ncbi_api_key or None,
         )
         search_results = Entrez.read(search_handle)
         search_handle.close()
@@ -147,7 +151,9 @@ def search_pubmed(query: str) -> str:
             db="pubmed",
             id=pmids,
             rettype="medline",
-            retmode="xml"
+            retmode="xml",
+            email=email,
+            api_key=settings.ncbi_api_key or None,
         )
         papers = Entrez.read(fetch_handle)
         fetch_handle.close()
@@ -168,7 +174,7 @@ def search_pubmed(query: str) -> str:
                 
                 # Publication date
                 pub_date = journal_info.get("JournalIssue", {}).get("PubDate", {})
-                year = pub_date.get("Year", "")
+                year = pub_date.get("Year", pub_date.get("MedlineDate", ""))
                 month = pub_date.get("Month", "")
                 day = pub_date.get("Day", "")
                 date_str = f"{year}-{month}-{day}".strip("-")
@@ -195,7 +201,7 @@ def search_pubmed(query: str) -> str:
                 paper_entry += f"Journal: {journal}\n"
                 paper_entry += f"Date: {date_str}\n"
                 paper_entry += f"PMID: {pmid}\n"
-                paper_entry += f"Abstract: {abstract[:500]}{'...' if len(abstract) > 500 else ''}\n"
+                paper_entry += f"Abstract: {abstract[:MAX_ABSTRACT_CHARS]}{'...' if len(abstract) > MAX_ABSTRACT_CHARS else ''}\n"
                 paper_entry += "-" * 80 + "\n"
                 
                 formatted_results.append(paper_entry)

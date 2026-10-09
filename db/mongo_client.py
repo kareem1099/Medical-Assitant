@@ -20,7 +20,7 @@ from pymongo import MongoClient
 from pymongo.collection import Collection
 from pymongo.database import Database
 
-from config.settings import settings
+from config.settings import mask_uri, settings
 
 
 logger = logging.getLogger(__name__)
@@ -45,7 +45,7 @@ def init_mongo() -> Database:
     global _client, _db
 
     try:
-        logger.info(f"Connecting to MongoDB at {settings.mongo_uri}")
+        logger.info(f"Connecting to MongoDB at {mask_uri(settings.mongo_uri)}")
         _client = MongoClient(settings.mongo_uri, serverSelectionTimeoutMS=5000)
         # Force a round trip so failures surface immediately at startup
         _client.admin.command("ping")
@@ -54,6 +54,7 @@ def init_mongo() -> Database:
 
         # Helpful indexes
         _db.projects.create_index("name")
+        _db.projects.create_index([("user_id", 1), ("created_at", -1)])
         _db.files.create_index("project_id")
         _db.chunks.create_index("project_id")
         _db.chunks.create_index("file_id")
@@ -63,7 +64,7 @@ def init_mongo() -> Database:
         return _db
 
     except Exception as e:
-        error_msg = f"Failed to connect to MongoDB at {settings.mongo_uri}: {str(e)}"
+        error_msg = f"Failed to connect to MongoDB at {mask_uri(settings.mongo_uri)}: {str(e)}"
         logger.error(error_msg)
         raise RuntimeError(error_msg) from e
 
@@ -100,7 +101,7 @@ def _to_object_id(value: str) -> ObjectId:
 # Projects
 # --------------------------------------------------------------------------
 
-def create_project(name: str, description: str = "") -> str:
+def create_project(name: str, description: str = "", user_id: Optional[str] = None) -> str:
     """
     Create a new project (an isolated workspace of documents).
 
@@ -118,6 +119,7 @@ def create_project(name: str, description: str = "") -> str:
     doc = {
         "name": name,
         "description": description.strip(),
+        "user_id": user_id,
         "created_at": datetime.utcnow(),
     }
     result = _projects().insert_one(doc)
@@ -125,28 +127,37 @@ def create_project(name: str, description: str = "") -> str:
     return str(result.inserted_id)
 
 
-def list_projects() -> List[Dict[str, Any]]:
+def list_projects(user_id: Optional[str] = None) -> List[Dict[str, Any]]:
     """Return all projects sorted by creation date (newest first)."""
     projects = []
-    for doc in _projects().find().sort("created_at", -1):
+    query = {"user_id": user_id} if user_id is not None else {}
+    for doc in _projects().find(query).sort([("created_at", -1), ("_id", -1)]):
         projects.append({
             "id": str(doc["_id"]),
             "name": doc["name"],
             "description": doc.get("description", ""),
+            "user_id": doc.get("user_id"),
             "created_at": doc.get("created_at"),
         })
     return projects
 
 
-def get_project(project_id: str) -> Optional[Dict[str, Any]]:
+def get_project(project_id: str, user_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """Fetch a single project by id, or None if it doesn't exist."""
-    doc = _projects().find_one({"_id": _to_object_id(project_id)})
+    try:
+        query = {"_id": _to_object_id(project_id)}
+    except ValueError:
+        return None
+    if user_id is not None:
+        query["user_id"] = user_id
+    doc = _projects().find_one(query)
     if not doc:
         return None
     return {
         "id": str(doc["_id"]),
         "name": doc["name"],
         "description": doc.get("description", ""),
+        "user_id": doc.get("user_id"),
         "created_at": doc.get("created_at"),
     }
 
@@ -196,17 +207,47 @@ def mark_file_failed(file_id: str, error_message: str) -> None:
 def list_files(project_id: str) -> List[Dict[str, Any]]:
     """List all files (and their processing status) belonging to a project."""
     files = []
-    for doc in _files().find({"project_id": project_id}).sort("uploaded_at", -1):
-        files.append({
-            "id": str(doc["_id"]),
-            "filename": doc["filename"],
-            "num_pages": doc.get("num_pages", 0),
-            "num_chunks": doc.get("num_chunks", 0),
-            "status": doc.get("status", "unknown"),
-            "error_message": doc.get("error_message"),
-            "uploaded_at": doc.get("uploaded_at"),
-        })
+    for doc in _files().find({"project_id": project_id}).sort([("uploaded_at", -1), ("_id", -1)]):
+        files.append(_file_to_dict(doc))
     return files
+
+
+def _file_to_dict(doc: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "id": str(doc["_id"]),
+        "project_id": doc.get("project_id"),
+        "filename": doc["filename"],
+        "num_pages": doc.get("num_pages", 0),
+        "num_chunks": doc.get("num_chunks", 0),
+        "status": doc.get("status", "unknown"),
+        "error_message": doc.get("error_message"),
+        "uploaded_at": doc.get("uploaded_at"),
+    }
+
+
+def get_file(file_id: str) -> Optional[Dict[str, Any]]:
+    """Fetch one file record by id (None if missing or the id is malformed)."""
+    try:
+        doc = _files().find_one({"_id": _to_object_id(file_id)})
+    except ValueError:
+        return None
+    return _file_to_dict(doc) if doc else None
+
+
+def find_file_by_name(project_id: str, filename: str) -> Optional[Dict[str, Any]]:
+    """Most recent file record with this name in the project (None if none)."""
+    doc = _files().find_one(
+        {"project_id": project_id, "filename": filename}, sort=[("uploaded_at", -1), ("_id", -1)]
+    )
+    return _file_to_dict(doc) if doc else None
+
+
+def delete_file(file_id: str) -> None:
+    """Delete only the file *record* (see delete_chunks_by_file for its chunks)."""
+    try:
+        _files().delete_one({"_id": _to_object_id(file_id)})
+    except ValueError:
+        pass
 
 
 # --------------------------------------------------------------------------
@@ -229,7 +270,7 @@ def insert_chunks(chunk_docs: List[Dict[str, Any]]) -> List[str]:
     return [str(_id) for _id in result.inserted_ids]
 
 
-def get_chunks_by_ids(chunk_ids: List[str]) -> Dict[str, Dict[str, Any]]:
+def get_chunks_by_ids(chunk_ids: List[str], user_id: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
     """
     Fetch chunk documents by their MongoDB ids.
 
@@ -238,8 +279,18 @@ def get_chunks_by_ids(chunk_ids: List[str]) -> Dict[str, Dict[str, Any]]:
     """
     if not chunk_ids:
         return {}
-    object_ids = [_to_object_id(cid) for cid in chunk_ids]
-    cursor = _chunks().find({"_id": {"$in": object_ids}})
+    object_ids = []
+    for cid in chunk_ids:
+        try:
+            object_ids.append(_to_object_id(cid))
+        except ValueError:
+            logger.warning("Ignoring malformed chunk id %r", cid)
+    if not object_ids:
+        return {}
+    query = {"_id": {"$in": object_ids}}
+    if user_id is not None:
+        query["user_id"] = user_id
+    cursor = _chunks().find(query)
     result = {}
     for doc in cursor:
         cid = str(doc["_id"])

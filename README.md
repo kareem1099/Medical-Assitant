@@ -11,17 +11,17 @@ An intelligent agentic RAG (Retrieval-Augmented Generation) system that answers 
 - **📄 Local RAG**: Searches uploaded medical PDF documents using vector similarity
 - **🔄 Hybrid Search**: Combines both sources when comprehensive answers are needed
 - **🎯 Smart Citations**: Distinguishes between PubMed papers and local documents with proper attribution
-- **💬 Chat Interface**: User-friendly Gradio web interface with conversation history
+- **💬 Web App ("Pulse")**: React + TypeScript site with live progress ("searching your documents / PubMed"), an evidence panel for every answer, drag & drop PDFs, Arabic/RTL and dark mode
 - **🔒 Medical Safety**: Built-in guardrails for uncertainty handling and appropriate disclaimers
 
 ## Architecture
 
 ```mermaid
 graph TD
-    User[User] -->|Query| GradioUI[Gradio Interface]
-    User -->|Upload PDF| GradioUI
+    User[User] -->|Query| WebUI[Web app - React + TypeScript, served by FastAPI]
+    User -->|Upload PDF| WebUI
     
-    GradioUI -->|User Query| StateGraph[LangGraph StateGraph]
+    WebUI -->|User Query| StateGraph[LangGraph StateGraph]
     
     StateGraph --> AgentNode[Agent Node<br/>Query Analysis & Tool Selection]
     AgentNode -->|Tool Decisions| ToolExecNode[Tool Executor Node]
@@ -41,8 +41,8 @@ graph TD
     PDFLoader -->|Store chunk text + file metadata| MongoDB
     Embedder -->|Embeddings| Qdrant
     
-    GradioUI -->|Create/Select Project| MongoDB
-    GradioUI -->|PDF Upload scoped to Project| PDFLoader
+    WebUI -->|Create/Select Project| MongoDB
+    WebUI -->|PDF Upload scoped to Project| PDFLoader
     
     PubMedTool -->|Results| ToolExecNode
     RAGTool -->|Results| ToolExecNode
@@ -52,8 +52,8 @@ graph TD
     GeminiLLM -->|Generated Answer| FinalNode
     
     FinalNode -->|Final Answer + Citations| StateGraph
-    StateGraph -->|Response| GradioUI
-    GradioUI -->|Display| User
+    StateGraph -->|Response| WebUI
+    WebUI -->|Display| User
 ```
 
 ## Technology Stack
@@ -64,7 +64,7 @@ graph TD
 - **Metadata & Content Storage**: MongoDB (projects, file metadata, chunk text)
 - **Embeddings**: sentence-transformers/all-MiniLM-L6-v2
 - **Medical Research API**: NCBI PubMed (via Biopython)
-- **User Interface**: Gradio (with multi-project workspace selector)
+- **User Interface**: React 18 + TypeScript + Vite (`web/`), served by a FastAPI JSON API (`api/`)
 - **Document Processing**: PyPDF2 with RecursiveCharacterTextSplitter
 
 ## Prerequisites
@@ -120,8 +120,11 @@ cp .env.example .env
 
 Required environment variables in `.env`:
 ```env
-GEMINI_API_KEY=your_gemini_api_key_here
-NCBI_EMAIL=your_email@example.com
+LLM_PROVIDER=cohere
+COHERE_API_KEY=your_cohere_api_key_here
+LLM_MODEL=command-a-03-2025
+GEMINI_API_KEY=
+NCBI_EMAIL=                      # Optional fallback; users enter email in the UI
 NCBI_API_KEY=your_ncbi_api_key_here  # Optional
 
 MONGO_URI=mongodb://localhost:27017
@@ -132,15 +135,35 @@ QDRANT_API_KEY=                      # Optional, for Qdrant Cloud
 QDRANT_COLLECTION_NAME=medical_chunks
 ```
 
-### 4. Run Application
+### 4. Build the web front-end (once, and after changing `web/`)
+
+Requires Node.js 18+.
+
+```bash
+cd web
+npm install
+npm run build
+```
+
+### 5. Run Application
 
 ```bash
 python app.py
 ```
 
-The application will be available at:
-- **Local**: http://localhost:7860
-- **Network**: http://0.0.0.0:7860
+Open http://localhost:7860. The server binds to `127.0.0.1` by default; set `APP_HOST=0.0.0.0` to expose it on your network.
+Set `APP_SECRET` in `.env` to keep people signed in across restarts.
+
+### Front-end development (hot reload)
+
+Run `python app.py` in one terminal and the Vite dev server in another; it proxies `/api` to the Python server:
+
+```bash
+cd web
+npm run dev
+```
+
+Then open http://localhost:5173.
 
 ## Usage Guide
 
@@ -148,10 +171,10 @@ The application will be available at:
 
 Every document and every RAG query is scoped to a **project**:
 
-1. Open the "📁 المشروع (Project)" panel at the top of the interface
-2. Create a new project (give it a name, optional description) or pick an existing one from the dropdown
-3. Upload PDFs and ask questions — both are scoped to the selected project
-4. Switch projects any time using the dropdown; each project has its own isolated set of documents/chunks (Qdrant search results are filtered by `project_id`, and MongoDB stores each project's files/chunks separately)
+1. Use the workspace switcher at the top of the left sidebar (every account starts with "My first workspace")
+2. Create a new workspace from the same menu, or delete one (with its documents and conversations)
+3. Upload PDFs and ask questions — both are scoped to the selected workspace
+4. Each workspace has its own isolated set of documents/chunks (Qdrant search results are filtered by `project_id` and `user_id`, and MongoDB stores each workspace's files/chunks separately)
 
 ### Asking Questions
 
@@ -191,15 +214,18 @@ Basic medical knowledge questions:
 
 ### Uploading PDFs
 
-1. Click **"Select PDF File"** in the left panel
-2. Choose a medical PDF document
-3. Click **"📤 Process PDF"**
-4. Wait for confirmation message showing number of chunks extracted
-5. Documents persist across sessions
+1. Open the **Library** tab in the right panel
+2. Drop PDFs onto it (or click to browse) - several at once is fine
+3. A progress bar shows the upload, then "Reading & indexing pages…"
+4. Uploading a file with the same name replaces the previous copy; the trash icon removes a document
 
 ### Citations
 
-Responses include properly formatted citations:
+Citations appear as coloured chips inside the answer (teal = your documents, violet = PubMed), and the
+**Evidence** panel lists every page and paper the answer used, with relevance scores and PubMed links.
+Answers that needed no search say so - the model is instructed never to invent references.
+
+Format used by the model:
 - **PubMed papers**: `[Title, Journal, Publication Date]`
 - **Local documents**: `[Filename, Page X]`
 - **Relevance scores**: Included for local document citations
@@ -219,17 +245,26 @@ smart-medical-assistant/
 ├── tools/                    # Tool implementations
 │   ├── pubmed_tool.py       # PubMed search tool
 │   ├── rag_tool.py          # Local RAG search tool
-│   └── pdf_loader.py        # PDF processing & vectorstore
+│   └── pdf_loader.py        # PDF processing and ingestion
 ├── prompts/                  # Prompt templates
 │   ├── system_prompt.py     # System-level instructions
 │   └── routing_prompt.py    # Agent routing logic
-├── ui/                       # User interface
-│   └── gradio_app.py        # Gradio interface
-├── vectorstore/              # ChromaDB persistent storage
-│   └── chroma_db/           # (created on first upload)
+├── api/                      # FastAPI JSON API + static hosting of web/dist
+│   ├── server.py            # Routes (auth, workspaces, files, conversations, streaming chat)
+│   └── sessions.py          # Signed httpOnly session cookie
+├── web/                      # React + TypeScript front-end ("Pulse")
+│   ├── src/App.tsx          # App state and data flow
+│   ├── src/components/      # Sidebar, Chat, EvidencePanel, AuthScreen, ...
+│   └── src/styles.css       # Design system (light + dark)
+├── src/                      # Controllers, services (assistant, citations, documents), stores
+├── ui/                       # Legacy Gradio interface (no longer started by app.py)
+├── db/                       # MongoDB and Qdrant data-access clients
+├── tests/                    # Regression tests
+│   └── test_pdf_loader.py
 ├── logs/                     # Application logs
 │   └── app.log              # (created on startup)
-├── requirements.txt          # Python dependencies
+├── requirements.txt          # Runtime dependencies
+├── requirements-dev.txt      # Test/development dependencies
 ├── .env.example             # Environment variable template
 └── README.md                # This file
 ```
@@ -240,8 +275,9 @@ smart-medical-assistant/
 
 | Variable | Description | Required |
 |----------|-------------|----------|
-| `GEMINI_API_KEY` | Google Gemini API key | Yes |
-| `NCBI_EMAIL` | Email for PubMed API | Yes |
+| `COHERE_API_KEY` | Cohere API key | Yes when `LLM_PROVIDER=cohere` |
+| `GEMINI_API_KEY` | Google Gemini API key | Yes when `LLM_PROVIDER=gemini` |
+| `NCBI_EMAIL` | Optional fallback; users normally enter email in the UI | No |
 | `NCBI_API_KEY` | NCBI API key (higher rate limits) | No |
 
 ### Optional Configuration
@@ -251,13 +287,15 @@ All parameters have sensible defaults but can be overridden in `.env`:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `EMBEDDING_MODEL` | sentence-transformers/all-MiniLM-L6-v2 | Embedding model |
-| `LLM_MODEL` | gemini-1.5-flash | Gemini model name |
+| `LLM_PROVIDER` | cohere | LLM provider (`cohere` or `gemini`) |
+| `LLM_MODEL` | command-a-03-2025 | Chat model name |
 | `LLM_TEMPERATURE` | 0.1 | Generation temperature (0.0-2.0) |
 | `CHUNK_SIZE` | 1000 | Text chunk size |
 | `CHUNK_OVERLAP` | 200 | Chunk overlap |
 | `TOP_K` | 5 | Number of results to retrieve |
-| `SCORE_THRESHOLD` | 0.5 | Minimum relevance score (0.0-1.0) |
-| `VECTORSTORE_PATH` | ./vectorstore/chroma_db | ChromaDB storage |
+| `SCORE_THRESHOLD` | 0.2 | Minimum relevance score (0.0-1.0) |
+| `QDRANT_URL` | http://localhost:6333 | Qdrant server URL |
+| `QDRANT_COLLECTION_NAME` | medical_chunks | Qdrant collection name |
 | `LOG_FILE` | ./logs/app.log | Log file path |
 
 ## Troubleshooting
@@ -268,13 +306,13 @@ All parameters have sensible defaults but can be overridden in `.env`:
 ```bash
 # Solution: Ensure required variables are set in .env
 cp .env.example .env
-# Edit .env and add GEMINI_API_KEY and NCBI_EMAIL
+# Edit .env and add COHERE_API_KEY and NCBI_EMAIL
 ```
 
 **Error**: "NCBI_EMAIL must be a valid email address"
 ```bash
 # Solution: Use a real email address with @ symbol
-NCBI_EMAIL=your_email@example.com
+NCBI_EMAIL=                      # Optional fallback; users enter email in the UI
 ```
 
 ### Import Errors
@@ -315,12 +353,16 @@ pip install -r requirements.txt
 ### Running Tests
 
 ```bash
-# Test configuration
-python test_config.py
+# Install test dependencies
+pip install -r requirements-dev.txt
 
-# Test specific components
-python test_vectorstore_init.py
+# Run the regression suite
+python -m pytest
 ```
+
+The regression suite does not require live MongoDB, Qdrant, PubMed, or Gemini
+credentials. Full end-to-end verification additionally requires the services
+and environment variables described in the Quick Start section.
 
 ### Logging
 
@@ -339,8 +381,9 @@ Log levels:
 ### Local Deployment
 
 1. Follow Quick Start instructions
-2. Run `python app.py`
-3. Access at http://localhost:7860
+2. Build the front-end: `cd web && npm install && npm run build`
+3. Run `python app.py`
+4. Access at http://localhost:7860
 
 ### Production Deployment
 
@@ -402,14 +445,14 @@ docker run -p 7860:7860 --env-file .env smart-medical-assistant
 For issues and questions:
 - Check Troubleshooting section above
 - Review logs in `./logs/app.log`
-- Verify configuration with `python test_config.py`
+- Run the offline checks with `python -m pytest`
 
 ## Acknowledgments
 
 - **LangChain & LangGraph**: Workflow orchestration
 - **Google Gemini**: Language model
 - **NCBI PubMed**: Medical research database
-- **ChromaDB**: Vector storage
+- **Qdrant**: Vector storage
 - **Gradio**: User interface framework
 
 
@@ -501,7 +544,8 @@ LLM_TEMPERATURE=0.05
 TOP_K=10
 CHUNK_SIZE=1200
 CHUNK_OVERLAP=300
-VECTORSTORE_PATH=/mnt/vector-storage/chroma_db
+QDRANT_URL=https://your-qdrant-host
+QDRANT_COLLECTION_NAME=medical_chunks
 LOG_FILE=/var/log/medical-assistant/app.log
 ```
 
@@ -554,11 +598,10 @@ def health_check():
 
 ### Backup and Recovery
 
-1. **Vector Store Backup**:
+1. **Database Backup**:
 ```bash
-# Automated daily backup
-tar -czf vectorstore-backup-$(date +%Y%m%d).tar.gz vectorstore/chroma_db/
-aws s3 cp vectorstore-backup-*.tar.gz s3://backup-bucket/
+# Back up MongoDB and use Qdrant snapshots according to your deployment
+mongodump --uri "$MONGO_URI" --db "$MONGO_DB_NAME" --archive | gzip > mongo-backup-$(date +%Y%m%d).archive.gz
 ```
 
 2. **Configuration Backup**:
@@ -571,7 +614,8 @@ aws s3 cp vectorstore-backup-*.tar.gz s3://backup-bucket/
 For production, use HTTPS:
 
 **Using Nginx Reverse Proxy**:
-```nginx
+``
+ginx
 server {
     listen 443 ssl;
     server_name medical-assistant.yourorg.com;
@@ -603,7 +647,7 @@ medical-assistant.yourorg.com {
    - Use Redis or Memcached for distributed cache
 
 2. **Connection Pooling**:
-   - Reuse ChromaDB connections
+   - Reuse Qdrant and MongoDB connections
    - Pool Gemini API connections
 
 3. **Async Processing**:
@@ -659,7 +703,7 @@ sudo nano /etc/logrotate.d/medical-assistant
 ```
 
 3. **Vector Store Maintenance**:
-- Periodically compact ChromaDB
+- Monitor Qdrant collection health and create snapshots
 - Remove outdated documents
 - Reindex if performance degrades
 
@@ -715,3 +759,31 @@ Before going live:
 
 **Last Updated**: 2024
 **Version**: 1.0.0
+
+## Testing
+
+The test-suite needs **no network, Docker, GPU or API keys** - MongoDB is replaced by `mongomock`,
+Qdrant by its in-memory mode, the embedding model by a deterministic fake and the LLM by a scripted
+stand-in. PubMed responses are realistic XML parsed by the real `Bio.Entrez` reader.
+
+```bash
+pip install -r requirements-dev.txt
+pytest                                   # ~270 tests, ~20 s
+pytest --cov=. --cov-report=term-missing # coverage (about 92 %)
+pytest tests/unit                        # fast unit tests only
+pytest -m integration                    # whole-app journeys (UI handlers + LangGraph + stores)
+```
+
+| Folder | What it covers |
+|---|---|
+| `tests/unit` | settings, password hashing, Mongo/Qdrant layers, PDF extraction + chunking, RAG and PubMed tools, routing rules, LLM nodes, citations, controllers, documents service |
+| `tests/ui` | every Gradio handler (auth, workspaces, documents, conversations, chat) and the wiring of every event (arity, event types) |
+| `tests/integration` | register -> upload PDF -> ask -> sources -> reload conversation; PubMed path; per-user isolation; cleanup |
+
+## Interface guide
+
+1. **Create an account** - a first workspace is created for you.
+2. **Workspace** (sidebar, top) - documents and conversations are scoped to it. Switch, create or delete workspaces.
+3. **Documents** - upload a PDF; uploading the same file name again *replaces* the old copy. Remove single documents from the accordion.
+4. **Settings -> NCBI email** - needed only for PubMed searches (not stored).
+5. Ask a question. The **Sources** panel lists exactly the documents (with page) and PubMed papers (linked) the answer was built from, and is restored when you reopen a conversation.
