@@ -1,5 +1,7 @@
 """HTTP-level tests for the web API (FastAPI TestClient, in-memory stores, stub workflow)."""
 import json
+import re
+from datetime import datetime, timedelta
 
 import pytest
 from fastapi.testclient import TestClient
@@ -8,6 +10,7 @@ from langchain_core.messages import AIMessage
 from api.server import create_app, safe_filename
 from api.sessions import COOKIE_NAME, SessionSigner
 from config.settings import settings
+from src.controllers import AuthController
 
 LOCAL_OUTPUT = """=== Local Document Search Results ===
 
@@ -47,13 +50,43 @@ def workflow():
     return StreamingWorkflow()
 
 
+class FakeMailer:
+    def __init__(self):
+        self.sent = []
+
+    def send(self, to, subject, body):
+        self.sent.append({"to": to, "subject": subject, "body": body})
+
+    def code(self, to):
+        """The code in the latest email to ``to``."""
+        mail = next(m for m in reversed(self.sent) if m["to"] == to)
+        return re.search(r"\b\d{6}\b", mail["body"]).group()
+
+
+class FakeGoogle:
+    """Stands in for Google's token check: the test credential is ``sub|email|name``."""
+
+    def verify(self, credential):
+        if credential.count("|") != 2:
+            raise ValueError("Wrong number of segments in token")
+        sub, email, name = credential.split("|")
+        return {"sub": sub, "email": email, "name": name}
+
+
 @pytest.fixture
-def app(storage, metadata, workflow, tmp_path):
+def mailer():
+    return FakeMailer()
+
+
+@pytest.fixture
+def app(storage, metadata, workflow, mailer, tmp_path):
     dist = tmp_path / "dist"
     (dist / "assets").mkdir(parents=True)
     (dist / "index.html").write_text("<!doctype html><title>SPA</title>")
     (dist / "assets" / "app.js").write_text("console.log(1)")
-    return create_app(workflow, metadata, static_dir=dist)
+    app = create_app(workflow, metadata, static_dir=dist, mailer=mailer, google=FakeGoogle())
+    app.state.mailer = mailer
+    return app
 
 
 @pytest.fixture
@@ -61,10 +94,19 @@ def client(app):
     return TestClient(app)
 
 
-def register(client, email="k@x.co", name="Kareem", password="password-123"):
-    r = client.post("/api/auth/register", json={"display_name": name, "email": email, "password": password})
+def register(client, email="k@x.co", name="Kareem"):
+    """Sign up with Google - the user ends up signed in."""
+    r = client.post("/api/auth/google", json={"credential": f"sub-{email}|{email}|{name}"})
     assert r.status_code == 200, r.text
     return r.json()["user"]
+
+
+def set_password(client, email="k@x.co", password="password-123"):
+    """Give an account a password through the forgot-password flow."""
+    client.post("/api/auth/forgot-password", json={"email": email})
+    code = client.app.state.mailer.code(email)
+    r = client.post("/api/auth/reset-password", json={"email": email, "code": code, "password": password})
+    assert r.status_code == 200, r.text
 
 
 @pytest.fixture
@@ -83,30 +125,96 @@ def ask(client, conv_id, message="What is hypertension?", email=""):
 
 
 # ------------------------------------------------------------------- auth
-def test_register_signs_in_with_http_only_cookie_and_creates_a_workspace(client):
-    r = client.post("/api/auth/register", json={"display_name": "Kareem", "email": "K@X.co", "password": "password-123"})
+def test_google_sign_up_signs_in_with_http_only_cookie_and_creates_a_workspace(client, metadata):
+    r = client.post("/api/auth/google", json={"credential": "g-1|K@X.co|Kareem"})
     assert r.status_code == 200 and r.json()["user"]["email"] == "k@x.co"
     assert "httponly" in r.headers["set-cookie"].lower() and "samesite=lax" in r.headers["set-cookie"].lower()
     assert client.get("/api/auth/me").json()["user"]["display_name"] == "Kareem"
     assert [w["name"] for w in client.get("/api/workspaces").json()] == ["My first workspace"]
+    user = metadata.users.find_one({"email": "k@x.co"})
+    assert user["email_verified"] is True and user["password_hash"] is None and user["google_sub"] == "g-1"
 
 
-@pytest.mark.parametrize("body,status", [
-    ({"display_name": "A", "email": "bad", "password": "password-123"}, 400),
-    ({"display_name": "A", "email": "a@b.co", "password": "short"}, 400),
-    ({"display_name": " ", "email": "a@b.co", "password": "password-123"}, 400),
-])
-def test_register_validation(client, body, status):
-    assert client.post("/api/auth/register", json=body).status_code == status
+def test_google_sign_in_again_reuses_the_account(client, metadata):
+    first = register(client)
+    client.post("/api/auth/logout")
+    second = client.post("/api/auth/google", json={"credential": "sub-k@x.co|k@x.co|Renamed"}).json()["user"]
+    assert first == second and metadata.users.count_documents({}) == 1
+    assert len(client.get("/api/workspaces").json()) == 1
 
 
-def test_duplicate_email_and_wrong_password(client):
+def test_bad_google_token_is_rejected(client):
+    r = client.post("/api/auth/google", json={"credential": "forged"})
+    assert r.status_code == 401 and client.get("/api/auth/me").status_code == 401
+
+
+def test_password_sign_up_is_gone(client):
+    body = {"display_name": "A", "email": "a@b.co", "password": "password-123"}
+    assert client.post("/api/auth/register", json=body).status_code == 404
+
+
+def test_google_takes_over_an_unverified_address_and_drops_its_password(client, metadata):
+    AuthController(metadata).register("k@x.co", "attacker-pass", "Squatter")
+    assert client.post("/api/auth/login", json={"email": "k@x.co", "password": "attacker-pass"}).status_code == 403
     register(client)
-    assert client.post("/api/auth/register", json={"display_name": "B", "email": "k@x.co", "password": "password-123"}).status_code == 400
+    client.post("/api/auth/logout")
+    assert metadata.users.count_documents({}) == 1
+    assert client.post("/api/auth/login", json={"email": "k@x.co", "password": "attacker-pass"}).status_code == 401
+
+
+def test_google_user_has_no_password_until_they_set_one(client):
+    register(client)
+    client.post("/api/auth/logout")
+    assert client.post("/api/auth/login", json={"email": "k@x.co", "password": "anything-at-all"}).status_code == 401
+    set_password(client)
     client.post("/api/auth/logout")
     r = client.post("/api/auth/login", json={"email": "k@x.co", "password": "nope-nope-nope"})
     assert r.status_code == 401 and r.json()["detail"] == "Invalid email or password"
     assert client.post("/api/auth/login", json={"email": "k@x.co", "password": "password-123"}).status_code == 200
+
+
+def test_forgot_and_reset_password(app, client, mailer):
+    register(client)
+    set_password(client, password="password-123")
+    other_device = TestClient(app)
+    other_device.post("/api/auth/login", json={"email": "k@x.co", "password": "password-123"})
+    assert other_device.get("/api/auth/me").status_code == 200
+
+    sent = len(mailer.sent)
+    assert client.post("/api/auth/forgot-password", json={"email": "ghost@x.co"}).json() == {"ok": True}
+    assert len(mailer.sent) == sent                                  # nobody to email, same answer
+    mailer.sent.clear()
+    assert client.post("/api/auth/forgot-password", json={"email": "K@x.co"}).json() == {"ok": True}
+    assert [m["to"] for m in mailer.sent] == ["k@x.co"]               # any case finds the account
+
+
+def test_reset_code_is_single_use_limited_and_rejects_weak_passwords(client, mailer, metadata):
+    register(client)
+    client.post("/api/auth/forgot-password", json={"email": "k@x.co"})
+    code = mailer.code("k@x.co")
+    assert "Reset" in mailer.sent[-1]["subject"]
+    weak = client.post("/api/auth/reset-password", json={"email": "k@x.co", "code": code, "password": "short"})
+    assert weak.status_code == 400
+    r = client.post("/api/auth/reset-password", json={"email": "k@x.co", "code": code, "password": "brand-new-pass"})
+    assert r.status_code == 200 and client.get("/api/auth/me").status_code == 200
+    again = client.post("/api/auth/reset-password", json={"email": "k@x.co", "code": code, "password": "another-pass"})
+    assert again.status_code == 400
+
+    metadata.users.update_one({"email": "k@x.co"}, {"$set": {"codes.reset.sent_at": datetime(2000, 1, 1)}})
+    client.post("/api/auth/forgot-password", json={"email": "k@x.co"})
+    good = mailer.code("k@x.co")
+    bad = "000000" if good != "000000" else "111111"
+    for _ in range(5):
+        body = {"email": "k@x.co", "code": bad, "password": "password-999"}
+        assert client.post("/api/auth/reset-password", json=body).status_code == 400
+    locked = client.post("/api/auth/reset-password", json={"email": "k@x.co", "code": good, "password": "password-999"})
+    assert locked.status_code == 400
+
+
+def test_reset_ends_sessions_started_before_it(client, metadata):
+    register(client)
+    metadata.users.update_one({"email": "k@x.co"}, {"$set": {"password_changed_at": datetime.utcnow() + timedelta(seconds=5)}})
+    assert client.get("/api/auth/me").status_code == 401
 
 
 def test_logout_and_anonymous_access(client):

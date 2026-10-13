@@ -10,6 +10,11 @@ USER, AUTH_PANEL, APP_PANEL, STATUS, WELCOME = range(5)
 PROJECT, PROJECT_DD, CONV_DD, SESSION, CHAT, SOURCES, FILES, FILE_SELECT = range(5, 13)
 
 
+def verify(h, out):
+    """Accounts must confirm their email before they can sign in again."""
+    h.auth.metadata.mark_email_verified(out[USER])
+
+
 def test_register_signs_in_and_creates_a_ready_workspace(h):
     out = h.register(" Kareem ", "Kareem@Example.com", "password-123")
     assert out[USER] and val(out[AUTH_PANEL], "visible") is False and val(out[APP_PANEL], "visible") is True
@@ -32,12 +37,12 @@ def test_register_errors_keep_the_sign_in_screen(h, name, email, password, needl
 
 
 def test_register_duplicate_email(h):
-    h.register("A", "a@b.co", "password-123")
+    verify(h, h.register("A", "a@b.co", "password-123"))
     assert "already exists" in h.register("B", "A@B.CO", "password-123")[STATUS]
 
 
 def test_login_success_and_failure_messages(h):
-    h.register("Kareem", "k@x.co", "password-123")
+    verify(h, h.register("Kareem", "k@x.co", "password-123"))
     ok = h.login("k@x.co", "password-123")
     assert ok[USER] and ok[PROJECT] and ok[SESSION]
     bad = h.login("k@x.co", "wrong-password")
@@ -47,7 +52,7 @@ def test_login_success_and_failure_messages(h):
 
 
 def test_login_reuses_existing_conversation_instead_of_creating_new_ones(h):
-    h.register("K", "k@x.co", "password-123")
+    verify(h, h.register("K", "k@x.co", "password-123"))
     first = h.login("k@x.co", "password-123")
     second = h.login("k@x.co", "password-123")
     assert first[SESSION] == second[SESSION]

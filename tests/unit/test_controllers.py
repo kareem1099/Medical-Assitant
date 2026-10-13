@@ -1,6 +1,7 @@
 import pytest
 
 from src.controllers import AuthController, ChatController, ConversationController, WorkspaceController
+from src.controllers.AuthController import VERIFY, EmailNotVerified
 
 
 @pytest.fixture
@@ -9,8 +10,12 @@ def auth(metadata):
 
 
 # ------------------------------------------------------------------- auth
-def test_register_and_login(auth):
+def test_register_and_login(auth, metadata):
     uid = auth.register("Kareem@Example.com", "password-123", "Kareem")
+    with pytest.raises(EmailNotVerified):
+        auth.login("kareem@example.com", "password-123")
+    _, code = auth.issue_code("kareem@example.com", VERIFY)
+    auth.verify_email("kareem@example.com", code)
     user = auth.login("kareem@example.com", "password-123")
     assert user == {"id": uid, "email": "kareem@example.com", "display_name": "Kareem"}
     assert "password_hash" not in user
@@ -27,8 +32,9 @@ def test_register_short_password(auth):
         auth.register("a@b.co", "short", "A")
 
 
-def test_register_duplicate_email_any_case(auth):
-    auth.register("a@b.co", "password-123", "A")
+def test_register_duplicate_email_any_case(auth, metadata):
+    uid = auth.register("a@b.co", "password-123", "A")
+    metadata.mark_email_verified(uid)
     with pytest.raises(ValueError, match="already exists"):
         auth.register("A@B.CO", "password-123", "A2")
 
@@ -41,7 +47,7 @@ def test_login_failures_share_one_message(auth, email, password):
 
 
 def test_login_updates_last_login(auth, metadata):
-    auth.register("a@b.co", "password-123", "A")
+    metadata.mark_email_verified(auth.register("a@b.co", "password-123", "A"))
     assert metadata.find_user_by_email("a@b.co")["last_login_at"] is None
     auth.login("a@b.co", "password-123")
     assert metadata.find_user_by_email("a@b.co")["last_login_at"] is not None

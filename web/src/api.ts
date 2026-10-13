@@ -55,8 +55,13 @@ export const api = {
   me: () => request<{ user: User }>("/auth/me").then((r) => r.user),
   login: (email: string, password: string) =>
     request<{ user: User }>("/auth/login", json("POST", { email, password })).then((r) => r.user),
-  register: (display_name: string, email: string, password: string) =>
-    request<{ user: User }>("/auth/register", json("POST", { display_name, email, password })).then((r) => r.user),
+  authConfig: () => request<{ google_client_id: string | null }>("/auth/config"),
+  /** Signs in - or creates the account - with a Google ID token. The only way to sign up. */
+  google: (credential: string) =>
+    request<{ user: User }>("/auth/google", json("POST", { credential })).then((r) => r.user),
+  forgotPassword: (email: string) => request<{ ok: boolean }>("/auth/forgot-password", json("POST", { email })),
+  resetPassword: (email: string, code: string, password: string) =>
+    request<{ user: User }>("/auth/reset-password", json("POST", { email, code, password })).then((r) => r.user),
   logout: () => request<{ ok: boolean }>("/auth/logout", json("POST")),
 
   workspaces: () => request<Workspace[]>("/workspaces"),

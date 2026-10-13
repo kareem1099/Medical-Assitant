@@ -52,8 +52,64 @@ class MongoMetadataProvider:
             "created_at": datetime.utcnow(),
             "last_login_at": None,
             "is_active": True,
+            "email_verified": False,
+            "codes": {},
         })
         return str(result.inserted_id)
+
+    def create_google_user(self, email: str, google_sub: str, display_name: str) -> str:
+        """Accounts from "Continue with Google": verified by Google, no password."""
+        result = self.users.insert_one({
+            "email": email.strip().lower(),
+            "password_hash": None,
+            "google_sub": google_sub,
+            "display_name": display_name.strip(),
+            "created_at": datetime.utcnow(),
+            "last_login_at": None,
+            "is_active": True,
+            "email_verified": True,
+            "codes": {},
+        })
+        return str(result.inserted_id)
+
+    def find_user_by_google_sub(self, google_sub: str) -> Optional[Dict[str, Any]]:
+        return self.users.find_one({"google_sub": google_sub, "is_active": True})
+
+    def link_google(self, user_id: str, google_sub: str, drop_password: bool) -> None:
+        """Google proved the address belongs to this person, so it counts as verified.
+        ``drop_password`` discards a password nobody ever proved they own."""
+        changes: Dict[str, Any] = {"google_sub": google_sub, "email_verified": True}
+        if drop_password:
+            changes["password_hash"] = None
+        self.users.update_one({"_id": self._id(user_id)},
+                              {"$set": changes, "$unset": {"codes.verify": ""}})
+
+    def update_unverified_user(self, user_id: str, password: str, display_name: str) -> None:
+        """Someone re-registers an address that was never verified: take the new details."""
+        self.users.update_one({"_id": self._id(user_id), "email_verified": False}, {"$set": {
+            "password_hash": hash_password(password),
+            "display_name": display_name.strip(),
+        }})
+
+    def store_code(self, user_id: str, purpose: str, code_hash: str, expires_at: datetime) -> None:
+        self.users.update_one({"_id": self._id(user_id)}, {"$set": {f"codes.{purpose}": {
+            "hash": code_hash, "expires_at": expires_at, "sent_at": datetime.utcnow(), "attempts": 0,
+        }}})
+
+    def count_code_attempt(self, user_id: str, purpose: str) -> None:
+        self.users.update_one({"_id": self._id(user_id)}, {"$inc": {f"codes.{purpose}.attempts": 1}})
+
+    def mark_email_verified(self, user_id: str) -> None:
+        self.users.update_one({"_id": self._id(user_id)},
+                              {"$set": {"email_verified": True}, "$unset": {"codes.verify": ""}})
+
+    def set_password(self, user_id: str, password: str) -> None:
+        """New password; also proves the address, and ends sessions issued before now."""
+        self.users.update_one({"_id": self._id(user_id)}, {
+            "$set": {"password_hash": hash_password(password), "email_verified": True,
+                     "password_changed_at": datetime.utcnow()},
+            "$unset": {"codes.reset": "", "codes.verify": ""},
+        })
 
     def find_user_by_email(self, email: str) -> Optional[Dict[str, Any]]:
         return self.users.find_one({"email": email.strip().lower(), "is_active": True})

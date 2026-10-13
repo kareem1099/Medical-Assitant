@@ -49,6 +49,19 @@ class Settings(BaseSettings):
     app_secret: Optional[str] = Field(default="", alias="APP_SECRET")
     max_upload_mb: int = Field(default=25, gt=0, alias="MAX_UPLOAD_MB")
 
+    # "Continue with Google" - the OAuth 2.0 Web client ID from Google Cloud Console.
+    # New accounts can only be created this way; empty disables sign-up.
+    google_client_id: str = Field(default="", alias="GOOGLE_CLIENT_ID")
+
+    # Outgoing email (verification and password-reset codes). When SMTP_HOST is
+    # empty the codes are printed to the server console / log instead (dev mode).
+    smtp_host: str = Field(default="", alias="SMTP_HOST")
+    smtp_port: int = Field(default=587, gt=0, lt=65536, alias="SMTP_PORT")
+    smtp_user: str = Field(default="", alias="SMTP_USER")
+    smtp_password: Optional[str] = Field(default="", alias="SMTP_PASSWORD")
+    smtp_from: str = Field(default="", alias="SMTP_FROM")
+    smtp_ssl: bool = Field(default=False, alias="SMTP_SSL")
+
     model_config = SettingsConfigDict(
         env_file=".env", env_file_encoding="utf-8", case_sensitive=False, extra="ignore"
     )
@@ -78,7 +91,7 @@ class Settings(BaseSettings):
 
     def get_masked_config(self) -> dict:
         config = self.model_dump()
-        for field in ("cohere_api_key", "gemini_api_key", "ncbi_api_key", "qdrant_api_key", "app_secret"):
+        for field in ("cohere_api_key", "gemini_api_key", "ncbi_api_key", "qdrant_api_key", "app_secret", "smtp_password"):
             if config.get(field):
                 config[field] = "***MASKED***"
         for field in ("mongo_uri", "qdrant_url"):

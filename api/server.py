@@ -4,6 +4,7 @@ Every route is scoped to the signed-in user: workspaces, documents and
 conversations of other users are reported as "not found".
 """
 
+import calendar
 import json
 import logging
 import re
@@ -23,8 +24,11 @@ from api.sessions import COOKIE_NAME, SessionSigner
 from config.settings import settings
 from db import mongo_client
 from src.controllers import AuthController, ChatController, ConversationController
+from src.controllers.AuthController import CODE_LIFETIME, RESET, EmailNotVerified
 from src.services.assistant import AnswerFailed, stream_answer
 from src.services.documents import DocumentService, WorkspaceAccessError
+from src.services.google_auth import GoogleVerifier
+from src.services.mailer import Mailer
 
 logger = logging.getLogger(__name__)
 
@@ -34,14 +38,22 @@ _EMAIL = re.compile(r"[^\s@]+@[^\s@]+\.[^\s@]+")
 
 
 # --------------------------------------------------------------------- schemas
-class RegisterIn(BaseModel):
-    display_name: str = Field(max_length=80)
-    email: str = Field(max_length=254)
-    password: str = Field(max_length=200)
+class GoogleIn(BaseModel):
+    credential: str = Field(max_length=4096)
 
 
 class LoginIn(BaseModel):
     email: str = Field(max_length=254)
+    password: str = Field(max_length=200)
+
+
+class EmailIn(BaseModel):
+    email: str = Field(max_length=254)
+
+
+class ResetIn(BaseModel):
+    email: str = Field(max_length=254)
+    code: str = Field(max_length=12)
     password: str = Field(max_length=200)
 
 
@@ -103,10 +115,13 @@ def _ndjson(event: Dict[str, Any]) -> bytes:
 
 # ------------------------------------------------------------------------ app
 def create_app(workflow, metadata, documents: Optional[DocumentService] = None,
-               static_dir: Optional[Path] = None, secure_cookies: bool = False) -> FastAPI:
+               static_dir: Optional[Path] = None, secure_cookies: bool = False,
+               mailer: Optional[Mailer] = None, google: Optional[GoogleVerifier] = None) -> FastAPI:
     app = FastAPI(title="Smart Medical Assistant", docs_url=None, redoc_url=None, openapi_url=None)
     signer = SessionSigner(settings.app_secret)
     documents = documents or DocumentService()
+    mailer = mailer or Mailer()
+    google = google or GoogleVerifier()
     auth = AuthController(metadata)
     conversations = ConversationController(metadata)
     chat = ChatController(metadata)
@@ -118,9 +133,11 @@ def create_app(workflow, metadata, documents: Optional[DocumentService] = None,
         return JSONResponse({"detail": "Something went wrong. Please try again."}, status_code=500)
 
     def current_user(request: Request) -> Dict[str, Any]:
-        user_id = signer.verify(request.cookies.get(COOKIE_NAME))
-        user = metadata.get_user(user_id) if user_id else None
-        if not user:
+        session = signer.read(request.cookies.get(COOKIE_NAME))
+        user = metadata.get_user(session[0]) if session else None
+        changed = (user or {}).get("password_changed_at")
+        if not user or not user.get("email_verified") or (
+                changed and session[1] < calendar.timegm(changed.utctimetuple())):   # signed in before a reset
             raise HTTPException(401, "Please sign in.")
         return {"id": str(user["_id"]), "email": user["email"], "display_name": user["display_name"]}
 
@@ -128,6 +145,24 @@ def create_app(workflow, metadata, documents: Optional[DocumentService] = None,
         response.set_cookie(COOKIE_NAME, signer.issue(user["id"]), max_age=signer.lifetime,
                             httponly=True, samesite="lax", secure=secure_cookies, path="/")
         return {"user": user}
+
+    def send_reset_code(email: str) -> None:
+        issued = auth.issue_code(email, RESET)
+        if not issued:
+            return
+        user, code = issued
+        minutes = int(CODE_LIFETIME.total_seconds() // 60)
+        body = (f"Hi {user['display_name']},\n\nUse this code to choose a new password:\n\n    {code}\n\n"
+                f"It expires in {minutes} minutes. If you didn't ask for it, you can ignore this email.\n\n- Pulse")
+        try:
+            mailer.send(user["email"], "Reset your Pulse password", body)
+        except Exception:
+            logger.exception("Could not send the password-reset email")
+            raise HTTPException(503, "We couldn't send the email right now. Please try again shortly.")
+
+    def ensure_workspace(user_id: str) -> None:
+        if not mongo_client.list_projects(user_id=user_id):
+            mongo_client.create_project(DEFAULT_WORKSPACE, "", user_id=user_id)   # ready to use right away
 
     def workspace(workspace_id: str, user: Dict[str, Any]) -> Dict[str, Any]:
         project = mongo_client.get_project(workspace_id, user_id=user["id"])
@@ -149,17 +184,38 @@ def create_app(workflow, metadata, documents: Optional[DocumentService] = None,
     def health():
         return {"ok": True}
 
-    @app.post("/api/auth/register")
-    def register(body: RegisterIn, response: Response):
+    @app.get("/api/auth/config")
+    def auth_config():
+        return {"google_client_id": settings.google_client_id or None}
+
+    @app.post("/api/auth/google")
+    def google_sign_in(body: GoogleIn, response: Response):
+        """Signs in - or creates the account on first use. The only way to sign up."""
+        try:
+            profile = google.verify(body.credential)
+        except ValueError as exc:
+            logger.warning("Rejected Google sign-in: %s", exc)
+            raise HTTPException(401, "Google sign-in failed. Please try again.")
+        user = auth.google_sign_in(profile)
+        ensure_workspace(user["id"])
+        return start_session(response, user)
+
+    @app.post("/api/auth/forgot-password")
+    def forgot_password(body: EmailIn):
+        """Same answer whether or not the address has an account."""
         if not email_is_valid(body.email):
             raise HTTPException(400, "Please enter a valid email address.")
+        send_reset_code(body.email)
+        return {"ok": True}
+
+    @app.post("/api/auth/reset-password")
+    def reset_password(body: ResetIn, response: Response):
         try:
-            user_id = auth.register(body.email.strip(), body.password, body.display_name)
+            user = auth.reset_password(body.email, body.code, body.password)
         except ValueError as exc:
             raise HTTPException(400, str(exc))
-        mongo_client.create_project(DEFAULT_WORKSPACE, "", user_id=user_id)   # ready to use right away
-        return start_session(response, {"id": user_id, "email": body.email.strip().lower(),
-                                        "display_name": body.display_name.strip()})
+        ensure_workspace(user["id"])
+        return start_session(response, user)
 
     @app.post("/api/auth/login")
     def login(body: LoginIn, response: Response):
@@ -167,6 +223,8 @@ def create_app(workflow, metadata, documents: Optional[DocumentService] = None,
             raise HTTPException(400, "Please enter a valid email address.")
         try:
             user = auth.login(body.email, body.password)
+        except EmailNotVerified as exc:
+            raise HTTPException(403, str(exc))
         except PermissionError as exc:
             raise HTTPException(401, str(exc))
         return start_session(response, user)

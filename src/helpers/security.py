@@ -4,6 +4,7 @@ import base64
 import hashlib
 import hmac
 import os
+import secrets
 
 _ITERATIONS = 310_000
 _SALT_BYTES = 16
@@ -32,3 +33,13 @@ def verify_password(password: str, encoded_hash: str) -> bool:
         return hmac.compare_digest(actual, expected)
     except (ValueError, TypeError):
         return False
+
+
+def new_code() -> str:
+    """Six-digit one-time code for email verification / password reset."""
+    return f"{secrets.randbelow(1_000_000):06d}"
+
+
+def hash_code(code: str) -> str:
+    """Codes are short-lived and attempt-limited, so a plain SHA-256 is enough at rest."""
+    return hashlib.sha256(code.strip().encode()).hexdigest()

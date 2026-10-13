@@ -9,7 +9,7 @@ import hashlib
 import hmac
 import secrets
 import time
-from typing import Optional
+from typing import Optional, Tuple
 
 COOKIE_NAME = "sma_session"
 SESSION_SECONDS = 7 * 24 * 3600
@@ -30,12 +30,17 @@ class SessionSigner:
 
     def verify(self, token: Optional[str], now: Optional[float] = None) -> Optional[str]:
         """Return the user id of a valid, unexpired token - otherwise None."""
+        session = self.read(token, now)
+        return session[0] if session else None
+
+    def read(self, token: Optional[str], now: Optional[float] = None) -> Optional[Tuple[str, int]]:
+        """``(user_id, issued_at_unix)`` of a valid, unexpired token - otherwise None."""
         try:
             user_id, expires, signature = (token or "").split(".")
             if not hmac.compare_digest(signature, self._sign(f"{user_id}.{expires}")):
                 return None
             if int(expires) < (time.time() if now is None else now):
                 return None
-            return user_id or None
+            return (user_id, int(expires) - self.lifetime) if user_id else None
         except ValueError:
             return None
